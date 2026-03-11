@@ -201,6 +201,15 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Runtime artifacts
+output/
+output_*/
+exports/
+exports_*/
+*.db
+*.db-wal
+*.db-shm
+logs/
 # Marimo
 marimo/_static/
 marimo/_lsp/
