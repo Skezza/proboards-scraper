@@ -1,0 +1,15 @@
+[Unit]
+Description=Poll remote Oatcake Archiver Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/joe/proboards-scraper/working_dir
+ExecStart=/home/joe/proboards-scraper/.venv/bin/python /home/joe/proboards-scraper/working_dir/scripts/poll_remote_worker.py --host 192.168.1.180 --host 192.168.1.133 --interval 60
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

@@ -6,7 +6,7 @@ import random
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -79,6 +79,9 @@ class RuntimeMetrics:
     last_cycle_ended_at: Optional[str] = None
     last_worker_state: str = "CATCHUP"
     last_idle_sleep_seconds: float = 0.0
+    expected_board_pages: int = 0
+    progress_refresh_requests: int = 25
+    progress: Dict[str, object] = field(default_factory=dict)
 
 
 class SingleInstanceLock:
@@ -161,10 +164,14 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 "last_cycle_started_at": self.metrics.last_cycle_started_at,
                 "last_cycle_ended_at": self.metrics.last_cycle_ended_at,
                 "last_worker_state": self.metrics.last_worker_state,
+                "progress": self.metrics.progress,
             }
             self._write(200, json.dumps(payload), "application/json")
             return
         if self.path == "/metrics":
+            progress = self.metrics.progress or {}
+            confidence = str(progress.get("confidence", "low"))
+            confidence_value = {"low": 0, "medium": 1, "high": 2}.get(confidence, 0)
             lines = [
                 f"oatcake_cycles_total {self.metrics.cycles_total}",
                 f"oatcake_cycles_with_changes_total {self.metrics.cycles_with_changes}",
@@ -173,6 +180,13 @@ class _MetricsHandler(BaseHTTPRequestHandler):
                 f"oatcake_requests_limited_total {self.metrics.requests_limited}",
                 f"oatcake_requests_fail_total {self.metrics.requests_fail}",
                 f"oatcake_last_idle_sleep_seconds {self.metrics.last_idle_sleep_seconds:.2f}",
+                f"oatcake_threads_discovered {int(progress.get('threads_discovered', 0))}",
+                f"oatcake_threads_archived {int(progress.get('threads_archived', 0))}",
+                f"oatcake_threads_total_estimated {int(progress.get('threads_total_estimated', 0))}",
+                f"oatcake_threads_remaining_estimated {int(progress.get('threads_remaining_estimated', 0))}",
+                f"oatcake_posts_archived_total {int(progress.get('posts_archived_total', 0))}",
+                f"oatcake_board_page_coverage_ratio {float(progress.get('page_coverage_ratio') or 0.0):.6f}",
+                f"oatcake_progress_confidence {confidence_value}",
             ]
             self._write(200, "\n".join(lines) + "\n", "text/plain; version=0.0.4")
             return
@@ -191,6 +205,14 @@ def _start_health_server(port: int, metrics: RuntimeMetrics):
     thread.start()
     logger.info("Health endpoint listening on :%s", port)
     return server
+
+
+def _refresh_progress(metrics: RuntimeMetrics, store: Optional[SQLiteArchiveStore], contexts: List[BoardContext]) -> None:
+    if store is None:
+        return
+    expected_board_pages = sum(max(1, context.last_page) for context in contexts)
+    metrics.expected_board_pages = expected_board_pages
+    metrics.progress = store.progress_snapshot(expected_board_pages=expected_board_pages)
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -319,6 +341,18 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=1,
         help="When updating existing threads, start this many pages before last_page_crawled",
+    )
+    parser.add_argument(
+        "--max-pages-per-thread",
+        type=int,
+        default=200,
+        help="Cap pages fetched per thread in recent/backfill phases per cycle (0 disables cap)",
+    )
+    parser.add_argument(
+        "--progress-refresh-requests",
+        type=int,
+        default=25,
+        help="Refresh health progress every N fetch requests during a long cycle (0 disables)",
     )
     parser.add_argument(
         "--idle-min-seconds",
@@ -525,13 +559,19 @@ def _crawl_thread(
     checkpoint: CheckpointManager,
     board_id: str,
     start_page: int,
-) -> Tuple[List[PostData], int, bool]:
+    max_pages: int = 0,
+) -> Tuple[List[PostData], int, bool, bool]:
     posts: List[PostData] = []
     page = max(1, start_page)
     max_page = page
     last_crawled = page - 1
     complete = True
+    pages_fetched = 0
+    capped = False
     while page <= max_page:
+        if max_pages > 0 and pages_fetched >= max_pages:
+            capped = True
+            break
         url = summary.url if page == 1 else f"{summary.url}?page={page}"
         try:
             html = fetcher.fetch(url)
@@ -546,8 +586,9 @@ def _crawl_thread(
         max_page = max(max_page, page_data.last_page)
         last_crawled = page
         checkpoint.mark_thread_page(board_id, summary.thread_id, page)
+        pages_fetched += 1
         page += 1
-    return posts, max(last_crawled, 1), complete
+    return posts, max(last_crawled, 1), complete, capped
 
 
 def _process_thread(
@@ -559,13 +600,15 @@ def _process_thread(
     writer: BoardWriter,
     counters: RunCounters,
     full_verify: bool,
+    max_pages: int = 0,
 ) -> bool:
-    posts, last_page_crawled, complete = _crawl_thread(
+    posts, last_page_crawled, complete, capped = _crawl_thread(
         summary,
         fetcher,
         checkpoint,
         board.board_id,
         start_page,
+        max_pages=max_pages,
     )
     if not complete:
         logger.warning(
@@ -581,7 +624,15 @@ def _process_thread(
         full_verify=full_verify,
     )
     _apply_merge_result(counters, result)
-    checkpoint.mark_thread_done(board.board_id, summary.thread_id)
+    if not capped:
+        checkpoint.mark_thread_done(board.board_id, summary.thread_id)
+    else:
+        logger.info(
+            "Thread %s hit per-cycle page cap (%s pages); merged partial progress to page %s",
+            summary.thread_id,
+            max_pages,
+            last_page_crawled,
+        )
     logger.info(
         "Merged thread %s (full_verify=%s, created=%s, new=%s, edited=%s, tombstoned=%s, restored=%s)",
         summary.thread_id,
@@ -605,6 +656,7 @@ def _run_recent_delta_phase(
     recent_pages: int,
     backfill_pages: int,
     tail_overlap_pages: int,
+    max_pages_per_thread: int,
     max_threads: int,
     consumed: int,
 ) -> int:
@@ -621,6 +673,7 @@ def _run_recent_delta_phase(
             page_data = _get_board_page(context, page, fetcher, base_url, cache)
             if page_data is None:
                 continue
+            checkpoint.mark_board_page(context.board.board_id, page)
             logger.info(
                 "Recent phase: board %s page %s/%s (%s threads)",
                 context.board.board_id,
@@ -645,6 +698,7 @@ def _run_recent_delta_phase(
                     writer,
                     counters,
                     full_verify=False,
+                    max_pages=max_pages_per_thread,
                 ):
                     consumed += 1
                     checkpoint.save()
@@ -660,6 +714,7 @@ def _run_global_backfill_phase(
     base_url: str,
     backfill_threads_per_run: int,
     tail_overlap_pages: int,
+    max_pages_per_thread: int,
     max_threads: int,
     consumed: int,
     return_stats: bool = False,
@@ -710,6 +765,7 @@ def _run_global_backfill_phase(
             thread_pos = 0
             checkpoint.set_global_backfill_cursor(page, board_pos, thread_pos)
             continue
+        checkpoint.mark_board_page(context.board.board_id, page)
 
         oldest_first_threads = list(reversed(page_data.threads))
         if thread_pos >= len(oldest_first_threads):
@@ -743,6 +799,7 @@ def _run_global_backfill_phase(
             writer,
             counters,
             full_verify=False,
+            max_pages=max_pages_per_thread,
         ):
             consumed += 1
             processed += 1
@@ -869,6 +926,7 @@ def _run_cycle(
         args.recent_pages,
         args.backfill_pages,
         args.tail_overlap_pages,
+        args.max_pages_per_thread,
         args.max_threads,
         consumed,
     )
@@ -884,6 +942,7 @@ def _run_cycle(
         config.base_url,
         args.backfill_threads_per_run,
         args.tail_overlap_pages,
+        args.max_pages_per_thread,
         args.max_threads,
         consumed,
         return_stats=True,
@@ -992,6 +1051,9 @@ def _wire_fetch_events(fetcher: Fetcher, store: Optional[SQLiteArchiveStore], me
                 retry_after_seconds=event.retry_after_seconds,
                 error=event.error,
             )
+            refresh_every = max(0, int(metrics.progress_refresh_requests))
+            if refresh_every and (metrics.requests_total % refresh_every == 0):
+                metrics.progress = store.progress_snapshot(expected_board_pages=metrics.expected_board_pages)
 
     fetcher.set_event_hook(_on_event)
 
@@ -1004,13 +1066,16 @@ def _run_crawl_once(args: argparse.Namespace) -> int:
     fetcher = Fetcher(config)
     checkpoint, writer, store = _open_storage(args, output_dir)
     metrics = RuntimeMetrics()
+    metrics.progress_refresh_requests = max(0, int(args.progress_refresh_requests))
     _wire_fetch_events(fetcher, store, metrics)
     run_id = None
     if store is not None:
         run_id = store.start_run(mode="once", worker_state="CATCHUP")
     try:
         contexts = _prepare_cycle_contexts(args, config, fetcher)
+        _refresh_progress(metrics, store, contexts)
         result = _run_cycle(args, config, fetcher, checkpoint, writer, contexts)
+        _refresh_progress(metrics, store, contexts)
         _structured_log(
             "run_summary",
             threads_new=result.counters.threads_new,
@@ -1057,6 +1122,7 @@ def _run_worker(args: argparse.Namespace) -> int:
     config = _build_config(args, output_dir, checkpoint_path)
     stop_event = Event()
     metrics = RuntimeMetrics()
+    metrics.progress_refresh_requests = max(0, int(args.progress_refresh_requests))
 
     def _signal_handler(signum, frame):  # noqa: ARG001
         logger.warning("Received signal %s, shutting down worker", signum)
@@ -1096,7 +1162,9 @@ def _run_worker(args: argparse.Namespace) -> int:
                             cycle_args.verify_threads_per_run = max(1, min(cycle_args.verify_threads_per_run, 2))
                             cycle_args.max_threads = max(1, min(args.max_threads or 20, 20))
                         contexts = _prepare_cycle_contexts(args, config, fetcher)
+                        _refresh_progress(metrics, store, contexts)
                         result = _run_cycle(cycle_args, config, fetcher, checkpoint, writer, contexts)
+                        _refresh_progress(metrics, store, contexts)
                         cycle_changed = result.any_changes
                         if cycle_changed:
                             metrics.cycles_with_changes += 1

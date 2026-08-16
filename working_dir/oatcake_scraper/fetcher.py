@@ -1,17 +1,26 @@
 import logging
+import hashlib
 import random
+import re
 import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import requests
 
 from .config import ScraperConfig
 
 logger = logging.getLogger(__name__)
+
+POW_CHALLENGE_MARKER = "POW_CHALLENGE_DATA"
+POW_FIELD_PATTERN = re.compile(
+    r"(?P<key>challenge_nonce|challenge_hmac|difficulty|difficulty_char|issued_at)\s*:\s*"
+    r"(?P<quote>['\"])(?P<value>.*?)(?P=quote)"
+)
 
 
 class FetchError(Exception):
@@ -119,6 +128,51 @@ class Fetcher:
         self._consecutive_failures = 0
         self._cooldown_until = 0.0
 
+    def _apply_pow_bypass_cookie(self, response: requests.Response) -> bool:
+        if POW_CHALLENGE_MARKER not in response.text:
+            return False
+
+        fields = {match.group("key"): match.group("value") for match in POW_FIELD_PATTERN.finditer(response.text)}
+        required_fields = {"challenge_nonce", "challenge_hmac", "difficulty", "difficulty_char", "issued_at"}
+        missing = required_fields - set(fields)
+        if missing:
+            raise requests.HTTPError(f"pow challenge missing fields: {sorted(missing)}")
+
+        try:
+            difficulty = int(fields["difficulty"])
+        except ValueError as exc:
+            raise requests.HTTPError(f"invalid pow difficulty: {fields['difficulty']}") from exc
+
+        prefix = fields["difficulty_char"] * difficulty
+        challenge_base = fields["challenge_nonce"] + fields["issued_at"]
+        digest = ""
+        solution = None
+        for candidate in range(1, 10_000_001):
+            candidate_text = str(candidate)
+            digest = hashlib.sha256((challenge_base + candidate_text).encode("utf8")).hexdigest()
+            if digest.startswith(prefix):
+                solution = candidate_text
+                break
+        if solution is None:
+            raise requests.HTTPError("pow challenge solution not found")
+
+        cookie_value = "|".join(
+            [
+                fields["challenge_nonce"],
+                fields["issued_at"],
+                solution,
+                digest,
+                fields["challenge_hmac"],
+            ]
+        )
+        hostname = urlparse(response.url).hostname
+        if hostname:
+            self._session.cookies.set("pow_bypass", cookie_value, domain=hostname, path="/")
+        else:
+            self._session.cookies.set("pow_bypass", cookie_value, path="/")
+        logger.info("Solved ProBoards proof-of-work challenge for %s", response.url)
+        return True
+
     def fetch(self, url: str) -> str:
         last_error: Optional[Exception] = None
         for attempt in range(1, self._max_retries + 1):
@@ -170,11 +224,18 @@ class Fetcher:
                     time.sleep(backoff)
                 continue
             try:
-                started = time.monotonic()
-                response = self._session.get(url, timeout=20)
-                latency_ms = int((time.monotonic() - started) * 1000)
-                status = response.status_code
-                retry_after = self._parse_retry_after(response.headers.get("Retry-After"))
+                for challenge_attempt in range(2):
+                    started = time.monotonic()
+                    response = self._session.get(url, timeout=20)
+                    latency_ms = int((time.monotonic() - started) * 1000)
+                    status = response.status_code
+                    retry_after = self._parse_retry_after(response.headers.get("Retry-After"))
+                    if self._apply_pow_bypass_cookie(response):
+                        self._last_request = time.monotonic()
+                        if challenge_attempt == 0:
+                            continue
+                        raise requests.HTTPError("pow challenge not cleared")
+                    break
                 if status in (406, 403):
                     logger.warning(
                         "Received %s from requests for %s, retrying with degraded wget path",

@@ -949,3 +949,89 @@ class SQLiteArchiveStore:
             "posts_deleted": int(deleted_row["c"]) if deleted_row else 0,
             "crawl_runs": int(runs_row["c"]) if runs_row else 0,
         }
+
+    def progress_snapshot(self, expected_board_pages: Optional[int] = None) -> Dict:
+        threads_discovered = self.count_threads()
+        posts_archived_total = self.count_posts()
+        boards_row = self._conn.execute("SELECT COUNT(*) AS c FROM boards").fetchone()
+        done_row = self._conn.execute("SELECT COUNT(*) AS c FROM thread_done WHERE done = 1").fetchone()
+        scanned_pages_row = self._conn.execute("SELECT COUNT(*) AS c FROM board_pages").fetchone()
+
+        boards_discovered = int(boards_row["c"]) if boards_row else 0
+        threads_archived = int(done_row["c"]) if done_row else 0
+        scanned_board_pages = int(scanned_pages_row["c"]) if scanned_pages_row else 0
+
+        page_coverage = None
+        confidence = "low"
+        threads_total_estimated = threads_discovered
+        if expected_board_pages and expected_board_pages > 0 and scanned_board_pages > 0:
+            page_coverage = min(1.0, scanned_board_pages / float(expected_board_pages))
+            bounded_coverage = max(0.05, page_coverage)
+            threads_total_estimated = max(
+                threads_discovered,
+                int(round(threads_discovered / bounded_coverage)),
+            )
+            if page_coverage >= 0.95:
+                confidence = "high"
+            elif page_coverage >= 0.50:
+                confidence = "medium"
+        elif threads_discovered > 0:
+            confidence = "medium"
+
+        runtime_state = self.get_runtime_state()
+        if runtime_state.get("clean_backfill_pass_seen"):
+            threads_total_estimated = max(threads_total_estimated, threads_discovered)
+            confidence = "high" if threads_discovered > 0 else confidence
+
+        global_cursor = self._get_state("global_backfill_cursor", {})
+        if not isinstance(global_cursor, dict):
+            global_cursor = {}
+
+        board_progress_rows = self._conn.execute(
+            """
+            SELECT t.board_id AS board_id,
+                   COUNT(*) AS discovered,
+                   COALESCE(SUM(CASE WHEN td.done = 1 THEN 1 ELSE 0 END), 0) AS archived
+            FROM threads t
+            LEFT JOIN thread_done td
+              ON td.board_id = t.board_id AND td.thread_id = t.thread_id
+            GROUP BY t.board_id
+            ORDER BY (COUNT(*) - COALESCE(SUM(CASE WHEN td.done = 1 THEN 1 ELSE 0 END), 0)) DESC,
+                     COUNT(*) DESC
+            LIMIT 5
+            """
+        ).fetchall()
+        coverage_by_board = []
+        for row in board_progress_rows:
+            discovered = int(row["discovered"] or 0)
+            archived = int(row["archived"] or 0)
+            remaining = max(0, discovered - archived)
+            coverage_by_board.append(
+                {
+                    "board_id": str(row["board_id"]),
+                    "threads_discovered": discovered,
+                    "threads_archived": archived,
+                    "threads_remaining": remaining,
+                }
+            )
+
+        threads_remaining_estimated = max(0, threads_total_estimated - threads_archived)
+        return {
+            "boards_discovered": boards_discovered,
+            "threads_discovered": threads_discovered,
+            "threads_archived": threads_archived,
+            "threads_total_estimated": threads_total_estimated,
+            "threads_remaining_estimated": threads_remaining_estimated,
+            "posts_archived_total": posts_archived_total,
+            "scanned_board_pages": scanned_board_pages,
+            "expected_board_pages": expected_board_pages or 0,
+            "page_coverage_ratio": page_coverage,
+            "confidence": confidence,
+            "next_work_hint": {
+                "page": int(global_cursor.get("page", 1) or 1),
+                "board_pos": int(global_cursor.get("board_pos", 0) or 0),
+                "thread_pos": int(global_cursor.get("thread_pos", 0) or 0),
+            },
+            "coverage_by_board": coverage_by_board,
+            "updated_at": utc_now_iso(),
+        }

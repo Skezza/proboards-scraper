@@ -39,6 +39,13 @@ python scraper.py worker run \
   --import-json-bootstrap
 ```
 
+Or use the helper script with startup health checks:
+```bash
+./scripts/workerctl.sh start
+./scripts/workerctl.sh status
+./scripts/workerctl.sh probe
+```
+
 4. Export compressed snapshot:
 ```bash
 python scraper.py export snapshot \
@@ -118,4 +125,38 @@ docker run --rm -p 8080:8080 -v "$PWD/data:/data" oatcake-archiver
 
 ```bash
 ./.venv/bin/python -m pytest -q
+```
+
+## Service Hardening (recommended)
+
+Install a persistent user service:
+```bash
+chmod +x scripts/workerctl.sh
+mkdir -p ~/.config/systemd/user
+cp deploy/oatcake-worker.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now oatcake-worker.service
+systemctl --user status oatcake-worker.service
+```
+
+Useful commands:
+```bash
+systemctl --user restart oatcake-worker.service
+journalctl --user -u oatcake-worker.service -f
+./scripts/workerctl.sh probe
+```
+
+Remote monitoring from this workstation:
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/oatcake-remote-poller.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now oatcake-remote-poller.service
+journalctl --user -u oatcake-remote-poller.service -f
+```
+
+One-shot installer for other Linux machines:
+```bash
+chmod +x deploy/install_linux_worker.sh
+./deploy/install_linux_worker.sh
 ```

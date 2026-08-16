@@ -1,0 +1,21 @@
+[Unit]
+Description=Oatcake Archiver Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__WORKING_DIR__
+ExecStart=__PYTHON_BIN__ scraper.py worker run --health-port __HEALTH_PORT__ --profile conservative --rate-limit-delay __RATE_LIMIT_DELAY__
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUSERBASE=__PYTHON_USER_BASE__
+Environment=PYTHONPATH=__PYTHON_SITE_PACKAGES__
+StandardOutput=append:__LOG_FILE__
+StandardError=append:__LOG_FILE__
+
+[Install]
+WantedBy=default.target
